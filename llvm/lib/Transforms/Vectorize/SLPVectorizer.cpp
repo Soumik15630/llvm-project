@@ -902,7 +902,16 @@ static std::optional<unsigned> getExtractIndex(const Instruction *E) {
     auto *CI = dyn_cast<ConstantInt>(E->getOperand(1));
     if (!CI)
       return std::nullopt;
-    return CI->getZExtValue();
+    // Check if the index is out of bound  - we can get the source vector from operand 0
+    unsigned Idx =  CI->getZExtValue();
+    if (auto *VecTy = dyn_cast<FixedVectorType>(E->getOperand(0)->getType()))
+    {
+      if (Idx >= VecTy->getNumElements())
+      {
+        return std::nullopt;
+      }
+    }
+    return Idx;
   }
   auto *EI = cast<ExtractValueInst>(E);
   if (EI->getNumIndices() != 1)
@@ -7990,7 +7999,17 @@ BoUpSLP::getReorderingData(const TreeEntry &TE, bool TopToBottom,
         if (Idx == PoisonMaskElem)
           continue;
         Value *V = TE.Scalars[ReorderMask[Idx]];
+        // UPDATION: to go with the new implementation of getExtractIndex()
+        if (isa<PoisonValue>(V))
+        {
+          continue; // safeguard to not cast them to instruction
+        }
+
         std::optional<unsigned> EI = getExtractIndex(cast<Instruction>(V));
+        if (!EI)
+        {
+          continue; // checking to the optional has value or not
+        }
         Idx = std::distance(ReorderMask.begin(), find(ReorderMask, *EI));
       }
     }
@@ -12483,10 +12502,22 @@ bool BoUpSLP::canReuseExtract(ArrayRef<Value *> VL,
       if (isa<UndefValue>(EE->getIndexOperand()))
         continue;
     std::optional<unsigned> Idx = getExtractIndex(Inst);
+    // UPDATION: with new implementation of getExtractIndex
+
     if (!Idx)
+      /* If getExtractIndex returns nullopt,it's either varaible or OOB
+       * if it is an ExtractElement with a constant index , it was OOB.- so 'undef' and we can continue
+       */
+        if (auto *EE = dyn_cast<ExtractElementInst>(Inst))
+        {
+          if (isa<ConstantInt>(EE->getIndexOperand()))
+          {
+            continue;
+          }
+        }
       return false;
     const unsigned ExtIdx = *Idx;
-    if (ExtIdx >= NElts)
+    if (ExtIdx >= NElts) // redundant now( helper handles OOB) but nothing hurts to keep it - it's safe
       continue;
     Indices[I] = ExtIdx;
     if (MinIdx > ExtIdx)
@@ -14374,7 +14405,8 @@ public:
       for (auto [I, V] :
            enumerate(ArrayRef(VL).slice(Part * SliceSize, Limit))) {
         // Ignore non-extractelement scalars.
-        if (isa<UndefValue>(V) ||
+        // Skip undefs and poison values explicitly
+        if (isa<UndefValue>(V) || isa<PoisonValue>(V) ||
             (!SubMask.empty() && SubMask[I] == PoisonMaskElem))
           continue;
         // If all users of instruction are going to be vectorized and this
@@ -14383,7 +14415,7 @@ public:
         // vectorized tree.
         // Also, avoid adjusting the cost for extractelements with multiple uses
         // in different graph entries.
-        auto *EE = cast<ExtractElementInst>(V);
+        auto *EE = dyn_cast<ExtractElementInst>(V); // using dyncast instead of cast to rule out the crash if v is not an extract elementinst
         VecBase = EE->getVectorOperand();
         UniqueBases.insert(VecBase);
         ArrayRef<TreeEntry *> VEs = R.getTreeEntries(V);
@@ -14407,9 +14439,10 @@ public:
                    }) ||
             (!VEs.empty() && !is_contained(VEs, E)))
           continue;
+        // handling the optional return of getExtractIndex
         std::optional<unsigned> EEIdx = getExtractIndex(EE);
         if (!EEIdx)
-          continue;
+          continue; // Skip OOB indices (as free or poison)
         unsigned Idx = *EEIdx;
         // Take credit for instruction that will become dead.
         if (EE->hasOneUse() || !PrevNodeFound) {
@@ -15009,6 +15042,7 @@ BoUpSLP::getEntryCost(const TreeEntry *E, ArrayRef<Value *> VectorizedVals,
         return InstructionCost(TTI::TCC_Free);
 
       auto *I = cast<Instruction>(UniqueValues[Idx]);
+      //Initialize SrcVecty
       if (!SrcVecTy) {
         if (ShuffleOrOp == Instruction::ExtractElement) {
           auto *EE = cast<ExtractElementInst>(I);
@@ -15024,30 +15058,37 @@ BoUpSLP::getEntryCost(const TreeEntry *E, ArrayRef<Value *> VectorizedVals,
           SrcVecTy = getWidenedType(OrigScalarTy, NumElts);
         }
       }
+      // UPDATION: to implement the change in getExtractIndex
+      // need index for both the optimization check and the bitmask
+      std::optional<unsigned> EI = getExtractIndex(I);
+
       if (I->hasOneUse()) {
         Instruction *Ext = I->user_back();
         if ((isa<SExtInst>(Ext) || isa<ZExtInst>(Ext)) &&
             all_of(Ext->users(), IsaPred<GetElementPtrInst>)) {
           // Use getExtractWithExtendCost() to calculate the cost of
           // extractelement/ext pair.
-          InstructionCost Cost = TTI->getExtractWithExtendCost(
-              Ext->getOpcode(), Ext->getType(), SrcVecTy, *getExtractIndex(I),
-              CostKind);
-          // Subtract the cost of s|zext which is subtracted separately.
-          Cost -= TTI->getCastInstrCost(
-              Ext->getOpcode(), Ext->getType(), I->getType(),
-              TTI::getCastContextHint(Ext), CostKind, Ext);
-          return Cost;
+          if (EI) // checks if Ei is valid not OOB
+          {
+            InstructionCost Cost = TTI->getExtractWithExtendCost(
+               Ext->getOpcode(), Ext->getType(), SrcVecTy, *getExtractIndex(I),
+               CostKind);
+            // Subtract the cost of s|zext which is subtracted separately.
+            Cost -= TTI->getCastInstrCost(
+                Ext->getOpcode(), Ext->getType(), I->getType(),
+                TTI::getCastContextHint(Ext), CostKind, Ext);
+            return Cost;
+          }
         }
       }
       if (DemandedElts.isZero())
         DemandedElts = APInt::getZero(getNumElements(SrcVecTy));
-      unsigned ExtIdx = *getExtractIndex(I);
       //Out-of-bounds extractelement produces poison.So it do no corresponds to a concrete vector lane,
       // so instead of treating it as an invalid pattern we can avoid marking any demanded element
-      if (ExtIdx  < DemandedElts.getBitWidth())
+      //UPDATION: to implement the new implementation of getExtractIndex
+      if (EI)
       {
-        DemandedElts.setBit(ExtIdx);
+        DemandedElts.setBit(*EI);
       }
       // DemandedElts.setBit(*getExtractIndex(I));
       return InstructionCost(TTI::TCC_Free);
@@ -17301,14 +17342,15 @@ BoUpSLP::tryToGatherSingleRegisterExtractElements(
       continue;
     std::optional<unsigned> Idx = getExtractIndex(EI);
     // Undefined index.
-    if (!Idx) {
+    if (!Idx) { // it covers the new implement of getExtractIndex because it returns nullopt for OOB
       UndefVectorExtracts.push_back(I);
       continue;
     }
-    if (Idx >= VecTy->getNumElements()) {
-      UndefVectorExtracts.push_back(I);
-      continue;
-    }
+    // The following check is redundant we already handle this in getExtractIndex it self
+    // if (Idx >= VecTy->getNumElements()) {
+    //   UndefVectorExtracts.push_back(I);
+    //   continue;
+    // }
     SmallBitVector ExtractMask(VecTy->getNumElements(), true);
     ExtractMask.reset(*Idx);
     if (isUndefVector(EI->getVectorOperand(), ExtractMask).all()) {
